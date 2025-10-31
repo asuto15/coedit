@@ -1,0 +1,8 @@
+server/target
+web/node_modules
+web/.next
+web/.yarn
+vault
+nginx/*.crt
+nginx/*.key
+.env
