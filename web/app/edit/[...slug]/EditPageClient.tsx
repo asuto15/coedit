@@ -291,6 +291,12 @@ export default function EditPageClient({ slugParts }: { slugParts: string[] }) {
   const pendingCursorRef = useRef<CursorState | null>(null)
   const compositionRangeRef = useRef<TextRange | null>(null)
   const wsReadyRef = useRef(false)
+  const adjustTextareaHeight = useCallback(() => {
+    const textarea = textareaRef.current
+    if (!textarea) return
+    textarea.style.height = 'auto'
+    textarea.style.height = `${textarea.scrollHeight}px`
+  }, [])
   const [displayName, setDisplayName] = useState(() => getInitialDisplayName(clientId))
   const [displayColor, setDisplayColor] = useState(() => getStoredColor(clientId))
   const displayNameRef = useRef(displayName)
@@ -345,6 +351,10 @@ export default function EditPageClient({ slugParts }: { slugParts: string[] }) {
     if (!wsReadyRef.current) return
     sendProfileUpdate()
   }, [sendProfileUpdate, displayName, displayColor])
+
+  useEffect(() => {
+    adjustTextareaHeight()
+  }, [content, adjustTextareaHeight])
 
   const sendCursorMessage = useCallback((cursor: CursorState) => {
     const ws = wsRef.current
@@ -1056,7 +1066,10 @@ export default function EditPageClient({ slugParts }: { slugParts: string[] }) {
     textarea.addEventListener('compositioncancel', handleCompositionCancel)
     handleSelectionChange()
     const handleScroll = () => setCursorRenderTick(t => t + 1)
-    const handleResize = () => setCursorRenderTick(t => t + 1)
+    const handleResize = () => {
+      setCursorRenderTick(t => t + 1)
+      adjustTextareaHeight()
+    }
     textarea.addEventListener('scroll', handleScroll)
     window.addEventListener('resize', handleResize)
     return () => {
@@ -1072,7 +1085,7 @@ export default function EditPageClient({ slugParts }: { slugParts: string[] }) {
         cursorThrottleRef.current = null
       }
     }
-  }, [sendCursorMessage, sendImeMessage])
+  }, [sendCursorMessage, sendImeMessage, adjustTextareaHeight])
 
  
   const remotePresenceList = useMemo(

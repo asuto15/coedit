@@ -609,7 +609,7 @@ button.tip-card:focus-visible {
   gap: 18px;
   width: 100%;
   min-height: clamp(420px, 70vh, 900px);
-  grid-auto-rows: minmax(0, 1fr);
+  grid-auto-rows: auto;
 }
 
 .editor-panel {
@@ -621,8 +621,8 @@ button.tip-card:focus-visible {
   flex-direction: column;
   overflow: hidden;
   position: relative;
-  min-height: 0;
-  height: 100%;
+  height: auto;
+  min-height: clamp(360px, 55vh, 640px);
 }
 
 .editor-panel.editor-panel--preview {
@@ -630,12 +630,13 @@ button.tip-card:focus-visible {
 }
 
 .editor-textarea {
-  flex: 1;
-  min-height: 0;
-  height: 100%;
+  flex: none;
+  min-height: clamp(320px, 50vh, 620px);
+  height: auto;
   width: 100%;
   border: none;
   resize: none;
+  overflow-y: hidden;
   padding: 20px 22px;
   font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
   font-size: 15px;
