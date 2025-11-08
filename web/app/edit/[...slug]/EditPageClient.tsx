@@ -296,6 +296,11 @@ export default function EditPageClient({ slugParts }: { slugParts: string[] }) {
     if (!textarea) return
     textarea.style.height = 'auto'
     textarea.style.height = `${textarea.scrollHeight}px`
+    const scrollY = typeof window !== 'undefined' ? window.scrollY : 0
+    const scrollX = typeof window !== 'undefined' ? window.scrollX : 0
+    if (typeof window !== 'undefined') {
+      window.scrollTo(scrollX, scrollY)
+    }
   }, [])
   const [displayName, setDisplayName] = useState(() => getInitialDisplayName(clientId))
   const [displayColor, setDisplayColor] = useState(() => getStoredColor(clientId))
