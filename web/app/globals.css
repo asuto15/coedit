@@ -605,11 +605,18 @@ button.tip-card:focus-visible {
 
 .editor-workspace {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 18px;
   width: 100%;
   min-height: clamp(420px, 70vh, 900px);
   grid-auto-rows: auto;
+}
+
+.editor-workspace--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.editor-workspace--split {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
 }
 
 .editor-panel {

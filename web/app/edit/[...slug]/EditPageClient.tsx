@@ -360,6 +360,10 @@ export default function EditPageClient({ slugParts }: { slugParts: string[] }) {
   useEffect(() => {
     adjustTextareaHeight()
   }, [content, adjustTextareaHeight])
+  useEffect(() => {
+    if (mode === 'preview') return
+    adjustTextareaHeight()
+  }, [mode, adjustTextareaHeight])
 
   const sendCursorMessage = useCallback((cursor: CursorState) => {
     const ws = wsRef.current
@@ -1018,6 +1022,7 @@ export default function EditPageClient({ slugParts }: { slugParts: string[] }) {
   }, [slug, clientId, content, storageKeyText])
 
   useEffect(() => {
+    if (mode === 'preview') return
     const textarea = textareaRef.current
     if (!textarea) return
     const handleSelectionChange = () => {
@@ -1090,7 +1095,7 @@ export default function EditPageClient({ slugParts }: { slugParts: string[] }) {
         cursorThrottleRef.current = null
       }
     }
-  }, [sendCursorMessage, sendImeMessage, adjustTextareaHeight])
+  }, [sendCursorMessage, sendImeMessage, adjustTextareaHeight, mode])
 
  
   const remotePresenceList = useMemo(
@@ -1257,6 +1262,8 @@ export default function EditPageClient({ slugParts }: { slugParts: string[] }) {
       : copyStatus === 'error'
         ? 'リンクをコピーできませんでした'
         : null
+  const workspaceClassName =
+    `editor-workspace ${mode === 'both' ? 'editor-workspace--split' : 'editor-workspace--single'}`
 
   if (authState !== 'authorized') {
     return (
@@ -1407,7 +1414,7 @@ export default function EditPageClient({ slugParts }: { slugParts: string[] }) {
             表示設定を保存
           </button>
         </form>
-        <div className="editor-workspace">
+        <div className={workspaceClassName}>
           {(mode === 'both' || mode === 'edit') && <div style={{ minWidth: 0, minHeight: 0, height: '100%' }}>{Editor}</div>}
           {(mode === 'both' || mode === 'preview') && <div style={{ minWidth: 0, minHeight: 0, height: '100%' }}>{Preview}</div>}
         </div>
