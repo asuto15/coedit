@@ -93,6 +93,10 @@ type ServerMsg =
 
 const OriginalWebSocket = globalThis.WebSocket
 
+type PendingPayload = string | ArrayBufferLike | Blob | ArrayBufferView
+
+const reconnectBuffers = new Map<string, PendingPayload[]>()
+
 function isBrowser(): boolean {
   return typeof window !== 'undefined'
 }
@@ -185,6 +189,7 @@ class CompatWebSocket extends (OriginalWebSocket ?? class {}) {
   private pendingOpIds: Set<string>
   private lastSnapshot?: Snapshot
   private readonly applyCompat: boolean
+  private pendingSends: PendingPayload[]
 
   constructor(url: string, protocols?: string | string[]) {
     if (!OriginalWebSocket) {
@@ -198,6 +203,8 @@ class CompatWebSocket extends (OriginalWebSocket ?? class {}) {
     this.messageTarget = new EventTarget()
     this.onMessageHandler = null
     this.pendingOpIds = new Set()
+    this.pendingSends = []
+    this.recoverBufferedPayloads()
     const parsedUrl = (() => {
       try {
         return new URL(finalUrl)
@@ -210,6 +217,15 @@ class CompatWebSocket extends (OriginalWebSocket ?? class {}) {
     if (this.applyCompat) {
       super.addEventListener('message', ev => {
         this.handleServerMessage(ev)
+      })
+      super.addEventListener('open', () => {
+        this.flushPendingSends()
+      })
+      super.addEventListener('close', () => {
+        if (this.pendingSends.length > 0) {
+          this.bufferForNextSocket(this.pendingSends)
+        }
+        this.pendingSends = []
       })
     }
   }
@@ -307,7 +323,7 @@ class CompatWebSocket extends (OriginalWebSocket ?? class {}) {
         label: msg.label ?? null,
         color: msg.color ?? null,
       }
-      super.send(JSON.stringify(hello))
+      this.enqueueOrSend(JSON.stringify(hello))
       const snapshot = await fetchSnapshot(this.sessionId, msg.password ? { password: msg.password } : undefined)
       this.lastSnapshot = snapshot
       this.dispatchCompat({ type: 'snapshot', payload: snapshot })
@@ -322,7 +338,7 @@ class CompatWebSocket extends (OriginalWebSocket ?? class {}) {
       return
     }
     if (typeof data !== 'string') {
-      super.send(data)
+      this.enqueueOrSend(data)
       return
     }
     try {
@@ -345,7 +361,7 @@ class CompatWebSocket extends (OriginalWebSocket ?? class {}) {
     } catch (error) {
       console.warn('互換WSラッパーで送信メッセージの解析に失敗しました', error)
     }
-    super.send(data)
+    this.enqueueOrSend(data)
   }
 
   private handleCompatPing(msg: CompatPingMessage) {
@@ -354,7 +370,7 @@ class CompatWebSocket extends (OriginalWebSocket ?? class {}) {
     if ('ts' in msg && typeof msg.ts === 'number') {
       payload.ts = msg.ts
     }
-    super.send(JSON.stringify(payload))
+    this.enqueueOrSend(JSON.stringify(payload))
   }
 
   private handleCompatOp(msg: CompatOpMessage) {
@@ -380,7 +396,7 @@ class CompatWebSocket extends (OriginalWebSocket ?? class {}) {
         ts: Date.now(),
       },
     }
-    super.send(JSON.stringify(editPayload))
+    this.enqueueOrSend(JSON.stringify(editPayload))
   }
 
   private handleServerMessage(ev: MessageEvent) {
@@ -433,6 +449,63 @@ class CompatWebSocket extends (OriginalWebSocket ?? class {}) {
       }
       default:
         break
+    }
+  }
+
+  private recoverBufferedPayloads() {
+    const key = this.resolveBufferKey()
+    if (!key) return
+    const buffered = reconnectBuffers.get(key)
+    if (buffered && buffered.length > 0) {
+      this.pendingSends.push(...buffered)
+      reconnectBuffers.delete(key)
+    }
+  }
+
+  private resolveBufferKey(): string | null {
+    if (this.sessionId && this.sessionId.length > 0) {
+      return this.sessionId
+    }
+    if (this.slug && this.slug.length > 0) {
+      return this.slug
+    }
+    return null
+  }
+
+  private bufferForNextSocket(payload: PendingPayload | PendingPayload[]) {
+    const key = this.resolveBufferKey()
+    if (!key) return
+    const existing = reconnectBuffers.get(key) ?? []
+    if (Array.isArray(payload)) {
+      existing.push(...payload)
+    } else {
+      existing.push(payload)
+    }
+    reconnectBuffers.set(key, existing)
+  }
+
+  private enqueueOrSend(data: PendingPayload) {
+    if (!this.applyCompat) {
+      super.send(data)
+      return
+    }
+    if (this.readyState === OriginalWebSocket.OPEN) {
+      super.send(data)
+      return
+    }
+    if (this.readyState === OriginalWebSocket.CLOSING || this.readyState === OriginalWebSocket.CLOSED) {
+      this.bufferForNextSocket(data)
+      return
+    }
+    this.pendingSends.push(data)
+  }
+
+  private flushPendingSends() {
+    if (!this.applyCompat || this.pendingSends.length === 0) return
+    const queue = this.pendingSends
+    this.pendingSends = []
+    for (const payload of queue) {
+      super.send(payload)
     }
   }
 }
