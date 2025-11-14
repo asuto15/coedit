@@ -7,6 +7,7 @@ pub struct Doc {
     pub log: Vec<Vec<OpKind>>,
     pub since_flush: usize,
     pub password_hash: Option<String>,
+    pub last_edit_ts: u64,
 }
 
 pub fn transform_ops(doc: &Doc, edit: &Edit) -> Vec<OpKind> {

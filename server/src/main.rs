@@ -6,17 +6,19 @@ mod state;
 mod storage;
 mod types;
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Duration};
 
 use axum::{
     Router,
     routing::{get, post},
 };
-use tracing::info;
+use tokio::time::sleep;
+use tracing::{error, info};
 
 use crate::{
     handlers::{http, ws},
     state::AppState,
+    storage::{flush_all_wals_to_snapshots, flush_snapshot_if_needed},
 };
 
 fn build_router(state: &AppState) -> Router {
@@ -76,6 +78,14 @@ async fn main() -> anyhow::Result<()> {
         allowed_origins,
     );
 
+    let hydrated = flush_all_wals_to_snapshots(&state).await?;
+    info!(
+        slugs = hydrated,
+        "replayed pending WAL entries into snapshots"
+    );
+
+    tokio::spawn(run_periodic_snapshot_flush(state.clone()));
+
     let app = build_router(&state);
 
     let addr = "0.0.0.0:9000";
@@ -83,6 +93,19 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn run_periodic_snapshot_flush(state: AppState) {
+    let interval = Duration::from_millis(state.flush_idle_ms.max(50));
+    loop {
+        sleep(interval).await;
+        let slugs: Vec<String> = { state.docs.read().keys().cloned().collect() };
+        for slug in slugs {
+            if let Err(err) = flush_snapshot_if_needed(&state, &slug).await {
+                error!(%slug, "periodic flush failed: {:#}", err);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
