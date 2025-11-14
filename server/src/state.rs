@@ -153,6 +153,8 @@ pub async fn get_or_load_doc(state: &AppState, slug: &str) -> anyhow::Result<Arc
     }
 
     let mut doc = Doc::default();
+    let mut wal_edit_count = 0usize;
+    let mut wal_last_ts = 0u64;
     let snap_path = snapshot_path(state, slug)?;
     if let Ok(content) = fs::read_to_string(&snap_path) {
         doc.content = content;
@@ -182,6 +184,8 @@ pub async fn get_or_load_doc(state: &AppState, slug: &str) -> anyhow::Result<Arc
                         apply_ops(&mut doc, &ops2);
                         doc.rev += 1;
                         doc.log.push(ops2);
+                        wal_edit_count += 1;
+                        wal_last_ts = wal_last_ts.max(entry.ts);
                     }
                     DocEvent::Cursor { op_id, .. } | DocEvent::Ime { op_id, .. } => {
                         if let Some(id) = op_id {
@@ -202,11 +206,18 @@ pub async fn get_or_load_doc(state: &AppState, slug: &str) -> anyhow::Result<Arc
                     apply_ops(&mut doc, &ops2);
                     doc.rev += 1;
                     doc.log.push(ops2);
+                    wal_edit_count += 1;
+                    if let Some(ts) = legacy.ts {
+                        wal_last_ts = wal_last_ts.max(ts);
+                    }
                 }
                 Err(err) => {
                     warn!("failed to parse wal entry for slug '{}': {:#}", slug, err);
                 }
             }
+        }
+        if wal_edit_count > 0 && wal_last_ts == 0 {
+            wal_last_ts = now_millis();
         }
         if !seen.is_empty() {
             let mut map = state.recent_ops.write();
@@ -217,6 +228,10 @@ pub async fn get_or_load_doc(state: &AppState, slug: &str) -> anyhow::Result<Arc
                 ro.insert(id);
             }
         }
+    }
+    if wal_edit_count > 0 {
+        doc.since_flush = wal_edit_count;
+        doc.last_edit_ts = wal_last_ts;
     }
     let pwd_path = password_path(state, slug)?;
     if let Ok(hash) = fs::read_to_string(&pwd_path) {
@@ -258,6 +273,7 @@ pub async fn apply_edit(state: &AppState, slug: &str, mut edit: Edit) -> anyhow:
             d.rev += 1;
             d.log.push(ops2.clone());
             d.since_flush += 1;
+            d.last_edit_ts = ts;
             (d.rev, ops2, edit.client_id)
         } else {
             (d.rev, vec![], edit.client_id)
@@ -265,7 +281,7 @@ pub async fn apply_edit(state: &AppState, slug: &str, mut edit: Edit) -> anyhow:
     };
 
     wal_append_event(state, slug, &DocEvent::Edit { edit: edit.clone() }, ts)?;
-    flush_snapshot_if_needed(state, slug).await?;
+    let _ = flush_snapshot_if_needed(state, slug).await?;
 
     if let Some(op_id) = edit.op_id {
         remember_op_id(state, slug, op_id);
@@ -323,7 +339,7 @@ fn propagate_presence_after_edit(state: &AppState, slug: &str, edit: &Edit, ts: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CursorState, ImeEvent, OpKind, TextRange};
+    use crate::types::{CursorState, DocEvent, Edit, ImeEvent, OpKind, TextRange};
     use std::{io::Write, path::Path};
 
     fn mk_state(tmp: &Path) -> AppState {
@@ -430,6 +446,37 @@ mod tests {
         let dr = d.read();
         assert_eq!(dr.rev, 2);
         assert_eq!(dr.content, "xy");
+    }
+
+    #[tokio::test]
+    async fn wal_load_marks_pending_flush_and_last_edit_ts() {
+        let base = std::env::temp_dir().join(format!("srvtest-pending-{}", Uuid::new_v4()));
+        fs::create_dir_all(&base).unwrap();
+        let state = mk_state(&base);
+        let slug = "pending";
+
+        let mk_edit = |text: &str| Edit {
+            base_rev: 0,
+            ops: vec![OpKind::Insert {
+                pos: 0,
+                text: text.into(),
+            }],
+            client_id: None,
+            op_id: Some(Uuid::new_v4()),
+            cursor_before: None,
+            cursor_after: None,
+            ts: None,
+        };
+
+        crate::storage::wal_append_event(&state, slug, &DocEvent::Edit { edit: mk_edit("a") }, 111)
+            .unwrap();
+        crate::storage::wal_append_event(&state, slug, &DocEvent::Edit { edit: mk_edit("b") }, 222)
+            .unwrap();
+
+        let doc = get_or_load_doc(&state, slug).await.unwrap();
+        let d = doc.read();
+        assert_eq!(d.since_flush, 2);
+        assert!(d.last_edit_ts >= 222);
     }
 
     #[tokio::test]

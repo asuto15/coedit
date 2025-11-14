@@ -6,8 +6,7 @@ use std::{
 };
 
 use crate::{
-    state::AppState,
-    state::get_or_load_doc,
+    state::{AppState, get_or_load_doc, now_millis},
     types::{CURRENT_WAL_VERSION, DocEvent, WalEntryV2},
 };
 use anyhow::bail;
@@ -67,22 +66,57 @@ pub fn wal_append_event(
     Ok(())
 }
 
-pub async fn flush_snapshot_if_needed(state: &AppState, slug: &str) -> anyhow::Result<()> {
-    let doc_arc = get_or_load_doc(state, slug).await?;
-    let should_flush;
-    {
-        let d = doc_arc.read();
-        should_flush = d.since_flush >= state.flush_max_ops;
+enum FlushMode {
+    Opportunistic,
+    Forced,
+}
+
+pub async fn flush_snapshot_if_needed(state: &AppState, slug: &str) -> anyhow::Result<bool> {
+    flush_snapshot(state, slug, FlushMode::Opportunistic).await
+}
+
+pub async fn flush_snapshot_force(state: &AppState, slug: &str) -> anyhow::Result<bool> {
+    flush_snapshot(state, slug, FlushMode::Forced).await
+}
+
+pub async fn flush_all_wals_to_snapshots(state: &AppState) -> anyhow::Result<usize> {
+    let slugs = collect_pending_wal_slugs(&state.wal_dir)?;
+    let mut flushed = 0usize;
+    for slug in slugs {
+        if flush_snapshot_force(state, &slug).await? {
+            flushed += 1;
+        }
     }
+    Ok(flushed)
+}
+
+async fn flush_snapshot(state: &AppState, slug: &str, mode: FlushMode) -> anyhow::Result<bool> {
+    let doc_arc = get_or_load_doc(state, slug).await?;
+    let now = now_millis();
+    let should_flush = {
+        let d = doc_arc.read();
+        match mode {
+            FlushMode::Opportunistic => {
+                let due_to_ops = d.since_flush >= state.flush_max_ops;
+                let due_to_idle = d.since_flush > 0
+                    && d.last_edit_ts > 0
+                    && now.saturating_sub(d.last_edit_ts) >= state.flush_idle_ms;
+                due_to_ops || due_to_idle
+            }
+            FlushMode::Forced => d.since_flush > 0,
+        }
+    };
     if !should_flush {
-        return Ok(());
+        return Ok(false);
     }
 
-    let (content, _rev);
+    let content;
     {
         let mut d = doc_arc.write();
+        if d.since_flush == 0 {
+            return Ok(false);
+        }
         content = d.content.clone();
-        _rev = d.rev;
         d.since_flush = 0;
     }
     let snap_path = snapshot_path(state, slug)?;
@@ -90,7 +124,35 @@ pub async fn flush_snapshot_if_needed(state: &AppState, slug: &str) -> anyhow::R
         fs::create_dir_all(parent)?;
     }
     fs::write(snap_path, content)?;
-    Ok(())
+    Ok(true)
+}
+
+fn collect_pending_wal_slugs(base: &Path) -> anyhow::Result<Vec<String>> {
+    fn visit(base: &Path, dir: &Path, acc: &mut Vec<String>) -> anyhow::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                visit(base, &path, acc)?;
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if fs::metadata(&path)?.len() == 0 {
+                    continue;
+                }
+                let rel = path.strip_prefix(base)?;
+                let mut rel_slug = rel.to_path_buf();
+                rel_slug.set_extension("");
+                let slug = rel_slug.to_string_lossy().replace('\\', "/");
+                acc.push(slug);
+            }
+        }
+        Ok(())
+    }
+
+    let mut slugs = Vec::new();
+    if base.exists() {
+        visit(base, base, &mut slugs)?;
+    }
+    Ok(slugs)
 }
 
 pub fn hash_password(password: &str) -> String {
@@ -125,8 +187,8 @@ pub fn persist_password_hash(
 mod tests {
     use super::*;
     use crate::document::Doc;
-    use crate::state::AppState;
-    use crate::types::DocEvent;
+    use crate::state::{AppState, now_millis};
+    use crate::types::{DocEvent, Edit, OpKind};
     use parking_lot::RwLock;
     use std::fs;
     use std::path::Path;
@@ -163,7 +225,8 @@ mod tests {
             .write()
             .insert(slug.into(), Arc::new(RwLock::new(doc)));
 
-        flush_snapshot_if_needed(&state, slug).await.unwrap();
+        let flushed = flush_snapshot_if_needed(&state, slug).await.unwrap();
+        assert!(flushed);
 
         let path = snapshot_path(&state, slug).unwrap();
         let stored = fs::read_to_string(path).unwrap();
@@ -171,6 +234,95 @@ mod tests {
 
         let doc_arc = state.docs.read().get(slug).unwrap().clone();
         assert_eq!(doc_arc.read().since_flush, 0);
+    }
+
+    #[tokio::test]
+    async fn flush_snapshot_if_needed_respects_idle_time() {
+        let base = std::env::temp_dir().join(format!("storage-idle-{}", Uuid::new_v4()));
+        fs::create_dir_all(&base).unwrap();
+        let state = mk_state(&base);
+        let slug = "idle-doc";
+        let mut doc = Doc::default();
+        doc.content = "idle".into();
+        doc.rev = 2;
+        doc.since_flush = 1;
+        doc.last_edit_ts = now_millis().saturating_sub(state.flush_idle_ms + 5);
+        state
+            .docs
+            .write()
+            .insert(slug.into(), Arc::new(RwLock::new(doc)));
+
+        let flushed = flush_snapshot_if_needed(&state, slug).await.unwrap();
+        assert!(flushed, "idle threshold should trigger flush");
+    }
+
+    #[tokio::test]
+    async fn flush_snapshot_force_ignores_idle_threshold() {
+        let base = std::env::temp_dir().join(format!("storage-force-{}", Uuid::new_v4()));
+        fs::create_dir_all(&base).unwrap();
+        let state = mk_state(&base);
+        let slug = "force-doc";
+        let mut doc = Doc::default();
+        doc.content = "force".into();
+        doc.rev = 3;
+        doc.since_flush = 1;
+        doc.last_edit_ts = now_millis();
+        state
+            .docs
+            .write()
+            .insert(slug.into(), Arc::new(RwLock::new(doc)));
+
+        let flushed = flush_snapshot_force(&state, slug).await.unwrap();
+        assert!(flushed, "force flush should ignore idle window");
+    }
+
+    #[tokio::test]
+    async fn flush_all_wals_to_snapshots_processes_pending_files() {
+        let base = std::env::temp_dir().join(format!("storage-bulk-{}", Uuid::new_v4()));
+        fs::create_dir_all(&base).unwrap();
+        let state = mk_state(&base);
+        let slug_a = "bulk/a";
+        let slug_b = "bulk/b";
+
+        let mk_edit = |text: &str| Edit {
+            base_rev: 0,
+            ops: vec![OpKind::Insert {
+                pos: 0,
+                text: text.into(),
+            }],
+            client_id: None,
+            op_id: None,
+            cursor_before: None,
+            cursor_after: None,
+            ts: None,
+        };
+
+        wal_append_event(
+            &state,
+            slug_a,
+            &DocEvent::Edit {
+                edit: mk_edit("alpha"),
+            },
+            100,
+        )
+        .unwrap();
+        wal_append_event(
+            &state,
+            slug_b,
+            &DocEvent::Edit {
+                edit: mk_edit("beta"),
+            },
+            200,
+        )
+        .unwrap();
+
+        let flushed = flush_all_wals_to_snapshots(&state).await.unwrap();
+        assert_eq!(flushed, 2);
+
+        let snap_a = snapshot_path(&state, slug_a).unwrap();
+        let snap_b = snapshot_path(&state, slug_b).unwrap();
+        assert_eq!(fs::read_to_string(snap_a).unwrap().trim(), "alpha");
+        assert_eq!(fs::read_to_string(snap_b).unwrap().trim(), "beta");
     }
 
     #[tokio::test]

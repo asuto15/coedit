@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::time::Duration;
-
 use axum::{
     extract::{
         Query, State, WebSocketUpgrade,
@@ -12,7 +9,8 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::Deserialize;
-use tokio::{sync::mpsc, time::sleep};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -25,7 +23,7 @@ use crate::{
         update_presence_ime, update_presence_profile,
     },
     state::{AppState, apply_edit, broadcast, get_or_load_doc, now_millis, remember_op_id},
-    storage::{flush_snapshot_if_needed, wal_append_event},
+    storage::wal_append_event,
     types::{ClientMsg, CompatOpContext, CursorState, DocEvent, Edit, ImeEvent, OpKind, ServerMsg},
 };
 
@@ -153,18 +151,6 @@ async fn handle_ws(state: AppState, slug: String, socket: WebSocket) {
         }
     });
 
-    let st2 = state.clone();
-    let slug2 = slug.clone();
-    let idle_ms = state.flush_idle_ms;
-    let flush_task = tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_millis(idle_ms)).await;
-            if let Err(e) = flush_snapshot_if_needed(&st2, &slug2).await {
-                error!("flush error: {:#}", e);
-            }
-        }
-    });
-
     tokio::select! {
         _ = (&mut send_task) => {}
         _ = (&mut recv_task) => {}
@@ -183,7 +169,6 @@ async fn handle_ws(state: AppState, slug: String, socket: WebSocket) {
             },
         );
     }
-    flush_task.abort();
 }
 
 async fn handle_client_message(
