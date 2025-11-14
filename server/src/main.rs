@@ -12,13 +12,19 @@ use axum::{
     Router,
     routing::{get, post},
 };
-use tokio::time::sleep;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal as unix_signal};
+use tokio::{
+    signal,
+    sync::{oneshot, watch},
+    time::sleep,
+};
 use tracing::{error, info};
 
 use crate::{
     handlers::{http, ws},
     state::AppState,
-    storage::{flush_all_wals_to_snapshots, flush_snapshot_if_needed},
+    storage::{flush_all_wals_to_snapshots, flush_snapshot_force, flush_snapshot_if_needed},
 };
 
 fn build_router(state: &AppState) -> Router {
@@ -84,28 +90,113 @@ async fn main() -> anyhow::Result<()> {
         "replayed pending WAL entries into snapshots"
     );
 
-    tokio::spawn(run_periodic_snapshot_flush(state.clone()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let periodic_handle = tokio::spawn(run_periodic_snapshot_flush(state.clone(), shutdown_rx));
+
+    let (signal_tx, signal_rx) = oneshot::channel();
+    tokio::spawn(listen_for_shutdown_signal(shutdown_tx.clone(), signal_tx));
 
     let app = build_router(&state);
 
     let addr = "0.0.0.0:9000";
     info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = signal_rx.await;
+        })
+        .await?;
+
+    let _ = shutdown_tx.send(true);
+
+    if let Err(err) = periodic_handle.await {
+        error!("periodic flush task aborted: {:#}", err);
+    }
+
+    match finalize_shutdown(&state).await {
+        Ok((loaded, wal)) => {
+            info!(loaded, wal, "flushed snapshots before shutdown");
+        }
+        Err(err) => {
+            error!("shutdown flush failed: {:#}", err);
+        }
+    }
     Ok(())
 }
 
-async fn run_periodic_snapshot_flush(state: AppState) {
+async fn run_periodic_snapshot_flush(state: AppState, mut shutdown: watch::Receiver<bool>) {
     let interval = Duration::from_millis(state.flush_idle_ms.max(50));
     loop {
-        sleep(interval).await;
-        let slugs: Vec<String> = { state.docs.read().keys().cloned().collect() };
-        for slug in slugs {
-            if let Err(err) = flush_snapshot_if_needed(&state, &slug).await {
-                error!(%slug, "periodic flush failed: {:#}", err);
+        tokio::select! {
+            _ = sleep(interval) => {
+                let slugs: Vec<String> = state.docs.read().keys().cloned().collect();
+                for slug in slugs {
+                    if let Err(err) = flush_snapshot_if_needed(&state, &slug).await {
+                        error!(%slug, "periodic flush failed: {:#}", err);
+                    }
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    break;
+                }
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn listen_for_shutdown_signal(
+    shutdown_tx: watch::Sender<bool>,
+    signal_tx: oneshot::Sender<()>,
+) {
+    info!("waiting for shutdown signal (Ctrl+C or SIGTERM)");
+    let mut sigterm_stream = match unix_signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(err) => {
+            error!("failed to install SIGTERM handler: {:#}", err);
+            signal::ctrl_c().await.ok();
+            let _ = shutdown_tx.send(true);
+            let _ = signal_tx.send(());
+            return;
+        }
+    };
+    tokio::select! {
+        _ = signal::ctrl_c() => info!("received Ctrl+C (SIGINT)"),
+        _ = sigterm_stream.recv() => info!("received SIGTERM"),
+    }
+    let _ = shutdown_tx.send(true);
+    let _ = signal_tx.send(());
+}
+
+#[cfg(not(unix))]
+async fn listen_for_shutdown_signal(
+    shutdown_tx: watch::Sender<bool>,
+    signal_tx: oneshot::Sender<()>,
+) {
+    info!("waiting for shutdown signal (Ctrl+C)");
+    if signal::ctrl_c().await.is_ok() {
+        info!("received Ctrl+C (SIGINT)");
+    }
+    let _ = shutdown_tx.send(true);
+    let _ = signal_tx.send(());
+}
+
+async fn finalize_shutdown(state: &AppState) -> anyhow::Result<(usize, usize)> {
+    let loaded = flush_loaded_docs(state).await?;
+    let wal = flush_all_wals_to_snapshots(state).await?;
+    Ok((loaded, wal))
+}
+
+async fn flush_loaded_docs(state: &AppState) -> anyhow::Result<usize> {
+    let slugs: Vec<String> = state.docs.read().keys().cloned().collect();
+    let mut flushed = 0usize;
+    for slug in slugs {
+        if flush_snapshot_force(state, &slug).await? {
+            flushed += 1;
+        }
+    }
+    Ok(flushed)
 }
 
 #[cfg(test)]
@@ -174,5 +265,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn flush_loaded_docs_writes_pending_content() {
+        let state = mk_state();
+        let slug = "flush-me";
+        let mut doc = Doc::default();
+        doc.content = "shutdown".into();
+        doc.rev = 1;
+        doc.since_flush = 1;
+        state
+            .docs
+            .write()
+            .insert(slug.into(), Arc::new(RwLock::new(doc)));
+
+        let flushed = flush_loaded_docs(&state).await.unwrap();
+        assert_eq!(flushed, 1);
+
+        let snap = crate::storage::snapshot_path(&state, slug).unwrap();
+        assert_eq!(fs::read_to_string(snap).unwrap(), "shutdown");
     }
 }
